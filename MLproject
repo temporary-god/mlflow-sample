@@ -1,0 +1,14 @@
+name: student-offer
+
+conda_env: conda.yaml
+
+entry_points:
+  main:
+    parameters:
+      epochs: {type: integer, default: 1}
+    command: "python student_offer.py --epochs {epochs}"
+
+  train_and_log:
+    parameters:
+      threshold: {type: float, default: 80.0}
+    command: "python student_offer.py --threshold {threshold}"
