@@ -198,9 +198,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--threshold", type=float, default=80.0)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--tracking_uri", type=str, default="http://localhost:5000")
+    parser.add_argument("--tracking_uri", type=str, default="http://10.0.11.179:5000")
     parser.add_argument("--experiment_name", type=str, default="student_drift_monitoring")
-    parser.add_argument("--pushgateway_url", type=str, default="http://localhost:9091")
+    parser.add_argument("--pushgateway_url", type=str, default="http://10.0.11.179:9091")
     args = parser.parse_args()
 
     main(args)
+
