@@ -11,8 +11,9 @@ from sklearn.metrics import accuracy_score
 from mlflow.models.signature import ModelSignature
 from mlflow.types import Schema, ColSpec
 from evidently.report import Report
-from evidently.metrics import DataDriftTable, ClassificationPerformanceMetric
+from evidently.metric_preset import DataDriftPreset, ClassificationPreset
 from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+from typing import Any, Dict, Optional
 
 
 class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
@@ -44,26 +45,60 @@ class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
         return acc, data
 
     def predict(self, context, model_input: pd.DataFrame) -> np.ndarray:
+        if self.pipeline is None:
+            raise RuntimeError("Model pipeline is not fitted. Call fit() before predict().")
         if not isinstance(model_input, pd.DataFrame):
             model_input = pd.DataFrame(model_input)
         preds = self.pipeline.predict(model_input[["marks"]].astype(float))
         return np.where(preds == 1, "Placed", "Not Placed").astype(str)
 
 
-def push_metrics_to_prometheus(train_acc, drift_score, pushgateway_url, job_name):
+def _ensure_url_scheme(url: str) -> str:
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    return "http://" + url
+
+
+def push_metrics_to_prometheus(
+    train_acc: float,
+    drift_score: float,
+    pushgateway_url: str,
+    job_name: str,
+    grouping_key: Optional[Dict[str, str]] = None,
+):
+    pushgateway_url = _ensure_url_scheme(pushgateway_url)
     registry = CollectorRegistry()
-    accuracy_metric = Gauge(
-        "student_model_train_accuracy", "Training accuracy", registry=registry
-    )
-    drift_metric = Gauge(
-        "student_model_drift_score", "Data drift score", registry=registry
-    )
+    accuracy_metric = Gauge("student_model_train_accuracy", "Training accuracy", registry=registry)
+    drift_metric = Gauge("student_model_drift_score", "Data drift score", registry=registry)
 
-    accuracy_metric.set(train_acc)
-    drift_metric.set(drift_score)
+    accuracy_metric.set(float(train_acc))
+    drift_metric.set(float(drift_score))
 
-    push_to_gateway(pushgateway_url, job=job_name, registry=registry)
-    print(f"✅ Pushed metrics to Prometheus at {pushgateway_url}")
+    try:
+        # grouping_key attaches labels such as run_id/model/version
+        push_to_gateway(pushgateway_url, job=job_name, registry=registry, grouping_key=grouping_key or {})
+        print(f"✅ Pushed metrics to Prometheus Pushgateway at {pushgateway_url} (job={job_name}, grouping_key={grouping_key})")
+    except Exception as e:
+        print(f"⚠️ Failed to push metrics to Pushgateway at {pushgateway_url}: {e}")
+
+
+def _recursive_find(obj: Any, target_key: str) -> Optional[Any]:
+    """
+    Recursively search dictionaries/lists for the first occurrence of target_key and return its value.
+    """
+    if isinstance(obj, dict):
+        if target_key in obj:
+            return obj[target_key]
+        for v in obj.values():
+            found = _recursive_find(v, target_key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _recursive_find(item, target_key)
+            if found is not None:
+                return found
+    return None
 
 
 def main(args):
@@ -71,27 +106,32 @@ def main(args):
     mlflow.set_experiment(args.experiment_name)
 
     model = StudentOfferLabelModel(threshold=args.threshold, epochs=args.epochs)
-    acc, reference_data = model.fit()
+    try:
+        acc, reference_data = model.fit()
+    except Exception as e:
+        print(f"ERROR during model.fit(): {e}")
+        raise
 
-    run_name = "student_model_with_drift_check"
     signature = ModelSignature(
         inputs=Schema([ColSpec("double", "marks")]),
         outputs=Schema([ColSpec("string")]),
     )
 
-    with mlflow.start_run(run_name=run_name) as run:
+    with mlflow.start_run(run_name="student_model_with_drift_check") as run:
         print(f"RUN_ID: {run.info.run_id}")
 
         mlflow.log_param("threshold", args.threshold)
         mlflow.log_param("epochs", args.epochs)
         mlflow.log_metric("train_accuracy", acc)
 
+        # Log model (note: the environment that loads the model later must have compatible deps)
         mlflow.pyfunc.log_model(
             artifact_path="model",
             python_model=model,
             signature=signature,
         )
 
+        # Prepare current data (synthetic)
         np.random.seed(42)
         current_data = pd.DataFrame(
             {
@@ -101,31 +141,57 @@ def main(args):
         )
         current_data["placed"] = (current_data["marks"] > args.threshold).astype(int)
 
-        report = Report(metrics=[DataDriftTable(), ClassificationPerformanceMetric()])
-        report.run(reference_data=reference_data, current_data=current_data)
+        # Build Evidently report using presets
+        try:
+            report = Report(metrics=[DataDriftPreset(), ClassificationPreset()])
+            report.run(reference_data=reference_data, current_data=current_data)
+        except Exception as e:
+            print(f"ERROR while running Evidently report: {e}")
+            # proceed but set drift-related defaults
+            report = None
 
-        report_path = "drift_report.html"
-        report.save_html(report_path)
-        mlflow.log_artifact(report_path, artifact_path="reports")
+        # Save report if it exists
+        drift_score = 0.0
+        if report is not None:
+            report_path = "drift_report.html"
+            try:
+                report.save_html(report_path)
+                mlflow.log_artifact(report_path, artifact_path="reports")
+                print(f"✅ Evidently report saved at {report_path} and logged to MLflow")
+            except Exception as e:
+                print(f"⚠️ Failed to save/log Evidently report: {e}")
 
-        print("✅ Model trained and drift report logged")
+            # Extract a numeric drift score robustly (search nested dict for 'number_of_drifted_columns')
+            try:
+                report_dict = report.as_dict()
+                found = _recursive_find(report_dict, "number_of_drifted_columns")
+                if found is not None:
+                    drift_score = float(found)
+                else:
+                    # fallback: try to find some other plausible keys, e.g., 'drift_score' or 'drift_share'
+                    alt = _recursive_find(report_dict, "drift_score") or _recursive_find(report_dict, "drift_share")
+                    if alt is not None:
+                        drift_score = float(alt)
+                    else:
+                        drift_score = 0.0
+                print(f"Extracted drift_score={drift_score} from Evidently report")
+            except Exception as e:
+                print(f"⚠️ Could not extract drift score from Evidently report: {e}")
+                drift_score = 0.0
+        else:
+            print("No Evidently report available; setting drift_score=0.0")
 
-        # Extract drift score from report (example using DataDriftTable)
-        drift_score = report.as_dict()["metrics"][0]["result"][
-            "number_of_drifted_columns"
-        ]
-
-        # Push metrics to Prometheus
+        # Push metrics to Prometheus Pushgateway (include run id and experiment as grouping labels)
+        grouping = {"run_id": run.info.run_id, "experiment": args.experiment_name, "model": "student_offer"}
         push_metrics_to_prometheus(
             train_acc=acc,
-            drift_score=float(drift_score),
+            drift_score=drift_score,
             pushgateway_url=args.pushgateway_url,
             job_name="student_model_monitoring",
+            grouping_key=grouping,
         )
 
-        print(
-            f"🔗 View in MLflow UI: {args.tracking_uri}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
-        )
+        print(f"🔗 View in MLflow UI: {args.tracking_uri}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}")
 
 
 if __name__ == "__main__":
@@ -133,10 +199,8 @@ if __name__ == "__main__":
     parser.add_argument("--threshold", type=float, default=80.0)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--tracking_uri", type=str, default="http://localhost:5000")
-    parser.add_argument(
-        "--experiment_name", type=str, default="student_drift_monitoring"
-    )
-    parser.add_argument("--pushgateway_url", type=str, default="localhost:9091")
+    parser.add_argument("--experiment_name", type=str, default="student_drift_monitoring")
+    parser.add_argument("--pushgateway_url", type=str, default="http://localhost:9091")
     args = parser.parse_args()
 
     main(args)
