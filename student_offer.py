@@ -24,13 +24,9 @@ class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
         self.epochs = max(1, int(epochs))
 
     def fit(self):
-        data = pd.DataFrame(
-            {
-                "student": [f"S{i+1}" for i in range(10)],
-                "marks": [55, 62, 71, 79, 80, 81, 85, 90, 95, 67],
-            }
-        )
-        dataset = mlflow.data.from_pandas(data, source="your_data.csv")
+        
+        data = pd.read_csv("student_marks.csv")
+        dataset = mlflow.data.from_pandas(data, source="student_marks.csv")
         data["placed"] = (data["marks"] > self.threshold).astype(int)
         X = data[["marks"]].astype(float)
         y = data["placed"].astype(int)
@@ -229,3 +225,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
+
