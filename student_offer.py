@@ -26,7 +26,7 @@ class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
     def fit(self):
         
         data = pd.read_csv("student_marks.csv")
-        dataset = mlflow.data.from_pandas(data, source="student_marks.csv")
+        //dataset = mlflow.data.from_pandas(data, source="student_marks.csv")
         mlflow.log_artifact("student_marks.csv", "data")
         data["placed"] = (data["marks"] > self.threshold).astype(int)
         X = data[["marks"]].astype(float)
@@ -226,5 +226,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
+
 
 
