@@ -14,6 +14,7 @@ from evidently.report import Report
 from evidently.metric_preset import DataDriftPreset, ClassificationPreset
 from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 from typing import Any, Dict, Optional
+from mlflow.data.pandas_dataset import PandasDataset
 
 
 class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
@@ -29,6 +30,7 @@ class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
                 "marks": [55, 62, 71, 79, 80, 81, 85, 90, 95, 67],
             }
         )
+		dataset = mlflow.data.from_pandas(data, source="your_data.csv")
         data["placed"] = (data["marks"] > self.threshold).astype(int)
         X = data[["marks"]].astype(float)
         y = data["placed"].astype(int)
@@ -204,4 +206,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
-
