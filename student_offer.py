@@ -30,7 +30,7 @@ class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
                 "marks": [55, 62, 71, 79, 80, 81, 85, 90, 95, 67],
             }
         )
-		dataset = mlflow.data.from_pandas(data, source="your_data.csv")
+        dataset = mlflow.data.from_pandas(data, source="your_data.csv")
         data["placed"] = (data["marks"] > self.threshold).astype(int)
         X = data[["marks"]].astype(float)
         y = data["placed"].astype(int)
@@ -48,7 +48,9 @@ class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
 
     def predict(self, context, model_input: pd.DataFrame) -> np.ndarray:
         if self.pipeline is None:
-            raise RuntimeError("Model pipeline is not fitted. Call fit() before predict().")
+            raise RuntimeError(
+                "Model pipeline is not fitted. Call fit() before predict()."
+            )
         if not isinstance(model_input, pd.DataFrame):
             model_input = pd.DataFrame(model_input)
         preds = self.pipeline.predict(model_input[["marks"]].astype(float))
@@ -70,16 +72,27 @@ def push_metrics_to_prometheus(
 ):
     pushgateway_url = _ensure_url_scheme(pushgateway_url)
     registry = CollectorRegistry()
-    accuracy_metric = Gauge("student_model_train_accuracy", "Training accuracy", registry=registry)
-    drift_metric = Gauge("student_model_drift_score", "Data drift score", registry=registry)
+    accuracy_metric = Gauge(
+        "student_model_train_accuracy", "Training accuracy", registry=registry
+    )
+    drift_metric = Gauge(
+        "student_model_drift_score", "Data drift score", registry=registry
+    )
 
     accuracy_metric.set(float(train_acc))
     drift_metric.set(float(drift_score))
 
     try:
         # grouping_key attaches labels such as run_id/model/version
-        push_to_gateway(pushgateway_url, job=job_name, registry=registry, grouping_key=grouping_key or {})
-        print(f"✅ Pushed metrics to Prometheus Pushgateway at {pushgateway_url} (job={job_name}, grouping_key={grouping_key})")
+        push_to_gateway(
+            pushgateway_url,
+            job=job_name,
+            registry=registry,
+            grouping_key=grouping_key or {},
+        )
+        print(
+            f"✅ Pushed metrics to Prometheus Pushgateway at {pushgateway_url} (job={job_name}, grouping_key={grouping_key})"
+        )
     except Exception as e:
         print(f"⚠️ Failed to push metrics to Pushgateway at {pushgateway_url}: {e}")
 
@@ -171,7 +184,9 @@ def main(args):
                     drift_score = float(found)
                 else:
                     # fallback: try to find some other plausible keys, e.g., 'drift_score' or 'drift_share'
-                    alt = _recursive_find(report_dict, "drift_score") or _recursive_find(report_dict, "drift_share")
+                    alt = _recursive_find(
+                        report_dict, "drift_score"
+                    ) or _recursive_find(report_dict, "drift_share")
                     if alt is not None:
                         drift_score = float(alt)
                     else:
@@ -184,7 +199,11 @@ def main(args):
             print("No Evidently report available; setting drift_score=0.0")
 
         # Push metrics to Prometheus Pushgateway (include run id and experiment as grouping labels)
-        grouping = {"run_id": run.info.run_id, "experiment": args.experiment_name, "model": "student_offer"}
+        grouping = {
+            "run_id": run.info.run_id,
+            "experiment": args.experiment_name,
+            "model": "student_offer",
+        }
         push_metrics_to_prometheus(
             train_acc=acc,
             drift_score=drift_score,
@@ -193,7 +212,9 @@ def main(args):
             grouping_key=grouping,
         )
 
-        print(f"🔗 View in MLflow UI: {args.tracking_uri}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}")
+        print(
+            f"🔗 View in MLflow UI: {args.tracking_uri}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
+        )
 
 
 if __name__ == "__main__":
@@ -202,7 +223,9 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--tracking_uri", type=str, default="http://10.0.11.179:5000")
     parser.add_argument("--experiment_name", type=str, default="sixdee_experiments")
-    parser.add_argument("--pushgateway_url", type=str, default="http://10.0.11.179:9091")
+    parser.add_argument(
+        "--pushgateway_url", type=str, default="http://10.0.11.179:9091"
+    )
     args = parser.parse_args()
 
     main(args)
