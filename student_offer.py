@@ -14,7 +14,6 @@ from evidently.report import Report
 from evidently.metric_preset import DataDriftPreset, ClassificationPreset
 from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 from typing import Any, Dict, Optional
-from mlflow.data.pandas_dataset import PandasDataset
 
 
 class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
@@ -24,10 +23,9 @@ class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
         self.epochs = max(1, int(epochs))
 
     def fit(self):
-        
+        # Read local dataset (this file will be logged to MLflow artifacts by main())
         data = pd.read_csv("student_marks.csv")
-        
-        mlflow.log_artifact("student_marks.csv", "data")
+
         data["placed"] = (data["marks"] > self.threshold).astype(int)
         X = data[["marks"]].astype(float)
         y = data["placed"].astype(int)
@@ -118,30 +116,58 @@ def main(args):
     mlflow.set_experiment(args.experiment_name)
 
     model = StudentOfferLabelModel(threshold=args.threshold, epochs=args.epochs)
-    try:
-        acc, reference_data = model.fit()
-    except Exception as e:
-        print(f"ERROR during model.fit(): {e}")
-        raise
 
-    signature = ModelSignature(
-        inputs=Schema([ColSpec("double", "marks")]),
-        outputs=Schema([ColSpec("string")]),
-    )
+    # Start a run (use nested=True if there's already an active run, e.g., when called via `mlflow run .`)
+    if mlflow.active_run() is None:
+        run_cm = mlflow.start_run(run_name="student_model_with_drift_check")
+    else:
+        run_cm = mlflow.start_run(run_name="student_model_with_drift_check", nested=True)
 
-    with mlflow.start_run(run_name="student_model_with_drift_check") as run:
+    with run_cm as run:
         print(f"RUN_ID: {run.info.run_id}")
+        # Now fit() runs with an active run so artifact logging/ tagging below attach correctly
+        try:
+            acc, reference_data = model.fit()
+        except Exception as e:
+            print(f"ERROR during model.fit(): {e}")
+            raise
+
+        signature = ModelSignature(
+            inputs=Schema([ColSpec("double", "marks")]),
+            outputs=Schema([ColSpec("string", "prediction")]),
+        )
 
         mlflow.log_param("threshold", args.threshold)
         mlflow.log_param("epochs", args.epochs)
         mlflow.log_metric("train_accuracy", acc)
 
+        # Log training dataset as an artifact and set tags so it appears as a column in the UI
+        try:
+            # log artifact under "data/student_marks.csv"
+            mlflow.log_artifact("student_marks.csv", artifact_path="data")
+            dataset_relpath = "data/student_marks.csv"
+            # set a short tag (visible as a column if you enable tags column in UI)
+            mlflow.set_tag("dataset", dataset_relpath)
+            # set the full artifact URI for convenience
+            try:
+                dataset_uri = mlflow.get_artifact_uri(dataset_relpath)
+                mlflow.set_tag("dataset_uri", dataset_uri)
+            except Exception as e:
+                print(f"⚠️ Could not resolve artifact URI: {e}")
+            print(f"✅ Logged dataset artifact and set tags: dataset={dataset_relpath}")
+        except Exception as e:
+            print(f"⚠️ Failed to log dataset artifact or set tags: {e}")
+
         # Log model (note: the environment that loads the model later must have compatible deps)
-        mlflow.pyfunc.log_model(
-            artifact_path="model",
-            python_model=model,
-            signature=signature,
-        )
+        try:
+            mlflow.pyfunc.log_model(
+                artifact_path="model",
+                python_model=model,
+                signature=signature,
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to log model: {e}")
+            raise
 
         # Prepare current data (synthetic)
         np.random.seed(42)
@@ -181,9 +207,9 @@ def main(args):
                     drift_score = float(found)
                 else:
                     # fallback: try to find some other plausible keys, e.g., 'drift_score' or 'drift_share'
-                    alt = _recursive_find(
-                        report_dict, "drift_score"
-                    ) or _recursive_find(report_dict, "drift_share")
+                    alt = _recursive_find(report_dict, "drift_score") or _recursive_find(
+                        report_dict, "drift_share"
+                    )
                     if alt is not None:
                         drift_score = float(alt)
                     else:
@@ -226,7 +252,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
-
-
-
-
