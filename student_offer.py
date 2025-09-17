@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-train_and_log_model.py
+train_and_log_model_with_path.py
 
 Usage example:
-python train_and_log_model.py \
+python train_and_log_model_with_path.py \
   --reference_path ./data/student_marks.csv \
   --threshold 80 \
   --epochs 1 \
@@ -31,8 +31,8 @@ from typing import Any, Dict, Optional
 
 class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
     """
-    mlflow.pyfunc model object. This class implements:
-      - fit(): optional helper used during training (not required by mlflow)
+    mlflow.pyfunc model object. Implements:
+      - fit(): helper used during training
       - predict(): required for pyfunc serving
       - load_context(): called by mlflow when the model is loaded in a different environment.
     """
@@ -94,15 +94,14 @@ class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
         values are local paths where mlflow extracted them inside the container.
         """
         try:
-            # If we logged an artifact with key 'student_marks.csv', it will be available here
-            self.reference_csv_path = context.artifacts.get("student_marks.csv")
+            # We logged the artifact with key 'data/student_marks.csv' (path-key),
+            # so look it up using that exact key.
+            self.reference_csv_path = context.artifacts.get("data/student_marks.csv")
         except Exception:
-            # older mlflow versions or missing artifact -> None
             self.reference_csv_path = None
 
         # Optionally, preload reference_data or do other init here
         if self.reference_csv_path and os.path.exists(self.reference_csv_path):
-            # Not strictly necessary for serving predictions, but useful for in-container drift checks
             try:
                 ref_df = pd.read_csv(self.reference_csv_path)
                 # you could compute stats or warm caches here if desired
@@ -214,8 +213,9 @@ def main(args):
         except Exception as e:
             print(f"⚠️ Failed to log reference CSV as run artifact: {e}")
 
-        # Prepare artifacts mapping for model: key->artifact name inside model bundle, value->local path
-        artifacts = {"student_marks.csv": args.reference_path}
+        # Prepare artifacts mapping for model: key -> path inside model bundle, value -> local path
+        # NOTE: using a path-like key so it lands under /opt/ml/model/data/student_marks.csv in the image.
+        artifacts = {"data/student_marks.csv": args.reference_path}
 
         # Log the mlflow.pyfunc model and include the CSV in the model bundle
         try:
@@ -223,9 +223,9 @@ def main(args):
                 artifact_path="model",
                 python_model=model,
                 signature=signature,
-                artifacts=artifacts,  # bundle student_marks.csv into the model artifact
+                artifacts=artifacts,  # bundle data/student_marks.csv into the model artifact
             )
-            print("✅ Logged pyfunc model and included reference CSV as model artifact.")
+            print("✅ Logged pyfunc model and included reference CSV as model artifact under data/")
         except Exception as e:
             print(f"⚠️ Failed to log model with artifacts: {e}")
             raise
@@ -272,7 +272,6 @@ def main(args):
             elif drift_score_field is not None:
                 drift_fraction = float(drift_score_field)
             else:
-                # fallback: 0.0
                 drift_fraction = 0.0
 
             # Use percent (0..100) for Prometheus metric
