@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
+"""
+train_and_log_model.py
+
+Usage example:
+python train_and_log_model.py \
+  --reference_path ./data/student_marks.csv \
+  --threshold 80 \
+  --epochs 1 \
+  --tracking_uri http://10.0.11.179:5000 \
+  --experiment_name sixdee_experiments \
+  --pushgateway_url http://10.0.11.179:9091
+"""
 import argparse
+import os
 import mlflow
 import mlflow.pyfunc
 import pandas as pd
@@ -17,15 +30,36 @@ from typing import Any, Dict, Optional
 
 
 class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
+    """
+    mlflow.pyfunc model object. This class implements:
+      - fit(): optional helper used during training (not required by mlflow)
+      - predict(): required for pyfunc serving
+      - load_context(): called by mlflow when the model is loaded in a different environment.
+    """
+
     def __init__(self, threshold: float = 80.0, epochs: int = 1):
         self.pipeline = None
         self.threshold = threshold
         self.epochs = max(1, int(epochs))
+        # When the model is loaded by MLflow model serve, load_context will set this path
+        self.reference_csv_path = None
 
-    def fit(self):
-        # Read local dataset (this file will be logged to MLflow artifacts by main())
-        data = pd.read_csv("student_marks.csv")
+    def fit(self, reference_data: Optional[pd.DataFrame] = None):
+        """
+        Fit the internal pipeline using reference_data DataFrame (or fallback to reading local path).
+        Returns (accuracy, reference_df)
+        """
+        if reference_data is None:
+            # fallback to reading file named 'student_marks.csv' in cwd
+            if os.path.exists("student_marks.csv"):
+                reference_data = pd.read_csv("student_marks.csv")
+            else:
+                raise FileNotFoundError(
+                    "No reference_data provided and student_marks.csv not found in cwd."
+                )
 
+        data = reference_data.copy()
+        # Create label column the same way your original code did
         data["placed"] = (data["marks"] > self.threshold).astype(int)
         X = data[["marks"]].astype(float)
         y = data["placed"].astype(int)
@@ -42,14 +76,39 @@ class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
         return acc, data
 
     def predict(self, context, model_input: pd.DataFrame) -> np.ndarray:
+        """
+        model_input is expected to be a DataFrame or convertible to one and contain a 'marks' column.
+        Returns "Placed"/"Not Placed" strings.
+        """
         if self.pipeline is None:
-            raise RuntimeError(
-                "Model pipeline is not fitted. Call fit() before predict()."
-            )
+            raise RuntimeError("Model pipeline is not fitted. Call fit() before predict().")
         if not isinstance(model_input, pd.DataFrame):
             model_input = pd.DataFrame(model_input)
         preds = self.pipeline.predict(model_input[["marks"]].astype(float))
         return np.where(preds == 1, "Placed", "Not Placed").astype(str)
+
+    def load_context(self, context):
+        """
+        Called by MLflow when model is loaded in a different environment (e.g., inside the served Docker image).
+        mlflow passes a context.artifacts mapping: keys are artifact names used when logging the model,
+        values are local paths where mlflow extracted them inside the container.
+        """
+        try:
+            # If we logged an artifact with key 'student_marks.csv', it will be available here
+            self.reference_csv_path = context.artifacts.get("student_marks.csv")
+        except Exception:
+            # older mlflow versions or missing artifact -> None
+            self.reference_csv_path = None
+
+        # Optionally, preload reference_data or do other init here
+        if self.reference_csv_path and os.path.exists(self.reference_csv_path):
+            # Not strictly necessary for serving predictions, but useful for in-container drift checks
+            try:
+                ref_df = pd.read_csv(self.reference_csv_path)
+                # you could compute stats or warm caches here if desired
+                # e.g., self.ref_stats = ref_df.describe()
+            except Exception:
+                pass
 
 
 def _ensure_url_scheme(url: str) -> str:
@@ -71,14 +130,13 @@ def push_metrics_to_prometheus(
         "student_model_train_accuracy", "Training accuracy", registry=registry
     )
     drift_metric = Gauge(
-        "student_model_drift_score", "Data drift score", registry=registry
+        "student_model_drift_score", "Data drift score (percent)", registry=registry
     )
 
     accuracy_metric.set(float(train_acc))
     drift_metric.set(float(drift_score))
 
     try:
-        # grouping_key attaches labels such as run_id/model/version
         push_to_gateway(
             pushgateway_url,
             job=job_name,
@@ -112,12 +170,21 @@ def _recursive_find(obj: Any, target_key: str) -> Optional[Any]:
 
 
 def main(args):
+    # Connect to mlflow
     mlflow.set_tracking_uri(args.tracking_uri)
     mlflow.set_experiment(args.experiment_name)
 
+    # Validate reference path exists where given
+    if not os.path.isfile(args.reference_path):
+        raise FileNotFoundError(f"Reference CSV not found at: {args.reference_path}")
+
+    # Read the reference data (this is the baseline used by Evidently)
+    reference_data = pd.read_csv(args.reference_path)
+
+    # Build and train model (we pass the DataFrame rather than hardcoding a name)
     model = StudentOfferLabelModel(threshold=args.threshold, epochs=args.epochs)
 
-    # Start a run (use nested=True if there's already an active run, e.g., when called via `mlflow run .`)
+    # Start MLflow run
     if mlflow.active_run() is None:
         run_cm = mlflow.start_run(run_name="student_model_with_drift_check")
     else:
@@ -125,13 +192,11 @@ def main(args):
 
     with run_cm as run:
         print(f"RUN_ID: {run.info.run_id}")
-        # Now fit() runs with an active run so artifact logging/ tagging below attach correctly
-        try:
-            acc, reference_data = model.fit()
-        except Exception as e:
-            print(f"ERROR during model.fit(): {e}")
-            raise
 
+        # Fit using provided reference_data (so we don't rely on a hardcoded file inside fit())
+        acc, ref_df = model.fit(reference_data=reference_data)
+
+        # Create signature for logging model
         signature = ModelSignature(
             inputs=Schema([ColSpec("double", "marks")]),
             outputs=Schema([ColSpec("string", "prediction")]),
@@ -141,35 +206,31 @@ def main(args):
         mlflow.log_param("epochs", args.epochs)
         mlflow.log_metric("train_accuracy", acc)
 
-        # Log training dataset as an artifact and set tags so it appears as a column in the UI
+        # Log the reference CSV as a run artifact (traceability) AND include it in model artifacts
+        # so the model bundle contains it for serving and for the docker build path.
         try:
-            # log artifact under "data/student_marks.csv"
-            mlflow.log_artifact("student_marks.csv", artifact_path="data")
-            dataset_relpath = "data/student_marks.csv"
-            # set a short tag (visible as a column if you enable tags column in UI)
-            mlflow.set_tag("dataset", dataset_relpath)
-            # set the full artifact URI for convenience
-            try:
-                dataset_uri = mlflow.get_artifact_uri(dataset_relpath)
-                mlflow.set_tag("dataset_uri", dataset_uri)
-            except Exception as e:
-                print(f"⚠️ Could not resolve artifact URI: {e}")
-            print(f"✅ Logged dataset artifact and set tags: dataset={dataset_relpath}")
+            mlflow.log_artifact(args.reference_path, artifact_path="data")
+            print(f"✅ Logged reference CSV as run artifact: {args.reference_path}")
         except Exception as e:
-            print(f"⚠️ Failed to log dataset artifact or set tags: {e}")
+            print(f"⚠️ Failed to log reference CSV as run artifact: {e}")
 
-        # Log model (note: the environment that loads the model later must have compatible deps)
+        # Prepare artifacts mapping for model: key->artifact name inside model bundle, value->local path
+        artifacts = {"student_marks.csv": args.reference_path}
+
+        # Log the mlflow.pyfunc model and include the CSV in the model bundle
         try:
             mlflow.pyfunc.log_model(
                 artifact_path="model",
                 python_model=model,
                 signature=signature,
+                artifacts=artifacts,  # bundle student_marks.csv into the model artifact
             )
+            print("✅ Logged pyfunc model and included reference CSV as model artifact.")
         except Exception as e:
-            print(f"⚠️ Failed to log model: {e}")
+            print(f"⚠️ Failed to log model with artifacts: {e}")
             raise
 
-        # Prepare current data (synthetic)
+        # Create synthetic current_data (you may replace with real incoming batch)
         np.random.seed(42)
         current_data = pd.DataFrame(
             {
@@ -179,49 +240,50 @@ def main(args):
         )
         current_data["placed"] = (current_data["marks"] > args.threshold).astype(int)
 
-        # Build Evidently report using presets
+        # Run Evidently report using the in-memory reference_data you read above
+        drift_score_percent = 0.0
         try:
             report = Report(metrics=[DataDriftPreset(), ClassificationPreset()])
-            report.run(reference_data=reference_data, current_data=current_data)
-        except Exception as e:
-            print(f"ERROR while running Evidently report: {e}")
-            # proceed but set drift-related defaults
-            report = None
+            report.run(reference_data=ref_df, current_data=current_data)
 
-        # Save report if it exists
-        drift_score = 0.0
-        if report is not None:
+            # Save and log report
             report_path = "drift_report.html"
-            try:
-                report.save_html(report_path)
-                mlflow.log_artifact(report_path, artifact_path="reports")
-                print(f"✅ Evidently report saved at {report_path} and logged to MLflow")
-            except Exception as e:
-                print(f"⚠️ Failed to save/log Evidently report: {e}")
+            report.save_html(report_path)
+            mlflow.log_artifact(report_path, artifact_path="reports")
+            print(f"✅ Evidently report saved at {report_path} and logged to MLflow")
 
-            # Extract a numeric drift score robustly (search nested dict for 'number_of_drifted_columns')
-            try:
-                report_dict = report.as_dict()
-                found = _recursive_find(report_dict, "number_of_drifted_columns")
-                if found is not None:
-                    drift_score = float(found)
-                else:
-                    # fallback: try to find some other plausible keys, e.g., 'drift_score' or 'drift_share'
-                    alt = _recursive_find(report_dict, "drift_score") or _recursive_find(
-                        report_dict, "drift_share"
-                    )
-                    if alt is not None:
-                        drift_score = float(alt)
-                    else:
-                        drift_score = 0.0
-                print(f"Extracted drift_score={drift_score} from Evidently report")
-            except Exception as e:
-                print(f"⚠️ Could not extract drift score from Evidently report: {e}")
-                drift_score = 0.0
-        else:
-            print("No Evidently report available; setting drift_score=0.0")
+            # Extract drift metrics robustly
+            report_dict = report.as_dict()
+            # Prefer a normalized share if present; otherwise derive from counts
+            num_drifted = _recursive_find(report_dict, "number_of_drifted_columns")
+            total_cols = (
+                _recursive_find(report_dict, "number_of_columns")
+                or len(ref_df.columns)
+                or None
+            )
+            drift_share = _recursive_find(report_dict, "drift_share")
+            drift_score_field = _recursive_find(report_dict, "drift_score")
 
-        # Push metrics to Prometheus Pushgateway (include run id and experiment as grouping labels)
+            drift_fraction = 0.0
+            if drift_share is not None:
+                drift_fraction = float(drift_share)
+            elif num_drifted is not None and total_cols:
+                drift_fraction = float(num_drifted) / float(total_cols)
+            elif drift_score_field is not None:
+                drift_fraction = float(drift_score_field)
+            else:
+                # fallback: 0.0
+                drift_fraction = 0.0
+
+            # Use percent (0..100) for Prometheus metric
+            drift_score_percent = float(drift_fraction) * 100.0
+            print(f"Extracted drift fraction={drift_fraction}, percent={drift_score_percent}")
+
+        except Exception as e:
+            print(f"ERROR while running Evidently report or extracting drift: {e}")
+            drift_score_percent = 0.0
+
+        # Push metrics
         grouping = {
             "run_id": run.info.run_id,
             "experiment": args.experiment_name,
@@ -229,12 +291,13 @@ def main(args):
         }
         push_metrics_to_prometheus(
             train_acc=acc,
-            drift_score=drift_score,
+            drift_score=drift_score_percent,
             pushgateway_url=args.pushgateway_url,
             job_name="student_model_monitoring",
             grouping_key=grouping,
         )
 
+        # Print MLflow UI link for convenience
         print(
             f"🔗 View in MLflow UI: {args.tracking_uri}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
         )
@@ -248,6 +311,12 @@ if __name__ == "__main__":
     parser.add_argument("--experiment_name", type=str, default="sixdee_experiments")
     parser.add_argument(
         "--pushgateway_url", type=str, default="http://10.0.11.179:9091"
+    )
+    parser.add_argument(
+        "--reference_path",
+        type=str,
+        required=True,
+        help="Local path to reference CSV that will be used as baseline and bundled into model artifacts.",
     )
     args = parser.parse_args()
 
