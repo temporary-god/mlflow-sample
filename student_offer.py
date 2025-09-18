@@ -121,10 +121,14 @@ def push_metrics_to_prometheus(
     drift_score: float,
     pushgateway_url: str,
     job_name: str,
+    image_name: str,
+    image_version: str,
     grouping_key: Optional[Dict[str, str]] = None,
 ):
     pushgateway_url = _ensure_url_scheme(pushgateway_url)
     registry = CollectorRegistry()
+
+    # numeric metrics
     accuracy_metric = Gauge(
         "student_model_train_accuracy", "Training accuracy", registry=registry
     )
@@ -135,6 +139,16 @@ def push_metrics_to_prometheus(
     accuracy_metric.set(float(train_acc))
     drift_metric.set(float(drift_score))
 
+    # build/info metric (labels for name + version). value=1 just indicates existence.
+    build_info = Gauge(
+        "student_model_build_info",
+        "Build info: image name and version (value=1 means present)",
+        ["image_name", "image_version"],
+        registry=registry,
+    )
+    # set label combination to 1
+    build_info.labels(image_name="evidently-metrics-student-offer_label_test", image_version="64").set(1)
+
     try:
         push_to_gateway(
             pushgateway_url,
@@ -143,11 +157,10 @@ def push_metrics_to_prometheus(
             grouping_key=grouping_key or {},
         )
         print(
-            f"✅ Pushed metrics to Prometheus Pushgateway at {pushgateway_url} (job={job_name}, grouping_key={grouping_key})"
+            f"✅ Pushed metrics to Pushgateway at {pushgateway_url} (job={job_name}, grouping_key={grouping_key}, image={image_name}:{image_version})"
         )
     except Exception as e:
         print(f"⚠️ Failed to push metrics to Pushgateway at {pushgateway_url}: {e}")
-
 
 def _recursive_find(obj: Any, target_key: str) -> Optional[Any]:
     """
@@ -320,3 +333,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
+
