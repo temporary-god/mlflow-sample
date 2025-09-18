@@ -147,7 +147,7 @@ def push_metrics_to_prometheus(
         registry=registry,
     )
     # set label combination to 1
-    build_info.labels(image_name="evidently-metrics-student-offer_label_test", image_version="64").set(1)
+    # build_info.labels(image_name="evidently-metrics-student-offer_label_test", image_version="64").set(1)
 
     try:
         push_to_gateway(
@@ -305,7 +305,7 @@ def main(args):
             train_acc=acc,
             drift_score=drift_score_percent,
             pushgateway_url=args.pushgateway_url,
-            job_name="student_model_monitoring",
+            job_name="test_student_model_monitoring",
             image_name=args.image_name,
             image_version=args.image_version,
             grouping_key=grouping,
@@ -341,5 +341,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
+
 
 
