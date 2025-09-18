@@ -124,6 +124,7 @@ def push_metrics_to_prometheus(
     image_name: str,
     image_version: str,
     grouping_key: Optional[Dict[str, str]] = None,
+    variant: str = "champion",  
 ):
     pushgateway_url = _ensure_url_scheme(pushgateway_url)
     registry = CollectorRegistry()
@@ -148,16 +149,25 @@ def push_metrics_to_prometheus(
     )
     # set label combination to 1
     # build_info.labels(image_name="evidently-metrics-student-offer_label_test", image_version="64").set(1)
+    build_info.labels(image_name=image_name, image_version=image_version, variant=variant).set(1)
+
+    # build the final grouping_key so all metrics get these labels when pushed
+    final_grouping = dict(grouping_key or {})
+    # defaults: keep run_id/experiment if provided but ensure variant + image labels present
+    final_grouping.setdefault("variant", variant)
+    final_grouping.setdefault("image_name", image_name)
+    final_grouping.setdefault("image_version", image_version)
 
     try:
         push_to_gateway(
             pushgateway_url,
             job=job_name,
             registry=registry,
-            grouping_key=grouping_key or {},
+            #grouping_key=grouping_key or {},
+            grouping_key=final_grouping,
         )
         print(
-            f"✅ Pushed metrics to Pushgateway at {pushgateway_url} (job={job_name}, grouping_key={grouping_key}, image={image_name}:{image_version})"
+            f"✅ Pushed metrics to Pushgateway at {pushgateway_url} (job={job_name}, grouping_key={final_grouping}, image={image_name}:{image_version}, variant={variant})"
         )
     except Exception as e:
         print(f"⚠️ Failed to push metrics to Pushgateway at {pushgateway_url}: {e}")
@@ -341,6 +351,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
+
 
 
 
