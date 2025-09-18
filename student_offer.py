@@ -306,6 +306,8 @@ def main(args):
             drift_score=drift_score_percent,
             pushgateway_url=args.pushgateway_url,
             job_name="student_model_monitoring",
+            image_name=args.image_name,
+            image_version=args.image_version,
             grouping_key=grouping,
         )
 
@@ -324,6 +326,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pushgateway_url", type=str, default="http://10.0.11.179:9091"
     )
+    # ADD THESE TWO LINES:
+    parser.add_argument("--image_name", type=str, default=os.environ.get("IMAGE_NAME", "student-offer"),
+                        help="Image name to attach to pushed metrics (env IMAGE_NAME fallback)")
+    parser.add_argument("--image_version", type=str, default=os.environ.get("IMAGE_VERSION", "dev"),
+                        help="Image version to attach to pushed metrics (env IMAGE_VERSION fallback)")
+
     parser.add_argument(
         "--reference_path",
         type=str,
@@ -333,4 +341,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
+
 
