@@ -9,7 +9,8 @@ python train_and_log_model_with_path.py \
   --epochs 1 \
   --tracking_uri http://10.0.11.179:5000 \
   --experiment_name sixdee_experiments \
-  --pushgateway_url http://10.0.11.179:9091
+  --register_model True \
+  --model_name evidently-metrics-student-offer
 """
 import argparse
 import os
@@ -25,32 +26,21 @@ from mlflow.models.signature import ModelSignature
 from mlflow.types import Schema, ColSpec
 from evidently.report import Report
 from evidently.metric_preset import DataDriftPreset, ClassificationPreset
-from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 from typing import Any, Dict, Optional
+from mlflow.tracking import MlflowClient
 
-
+# ---------------------
+# Model class
+# ---------------------
 class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
-    """
-    mlflow.pyfunc model object. Implements:
-      - fit(): helper used during training
-      - predict(): required for pyfunc serving
-      - load_context(): called by mlflow when the model is loaded in a different environment.
-    """
-
     def __init__(self, threshold: float = 80.0, epochs: int = 1):
         self.pipeline = None
         self.threshold = threshold
         self.epochs = max(1, int(epochs))
-        # When the model is loaded by MLflow model serve, load_context will set this path
         self.reference_csv_path = None
 
     def fit(self, reference_data: Optional[pd.DataFrame] = None):
-        """
-        Fit the internal pipeline using reference_data DataFrame (or fallback to reading local path).
-        Returns (accuracy, reference_df)
-        """
         if reference_data is None:
-            # fallback to reading file named 'student_marks.csv' in cwd
             if os.path.exists("student_marks.csv"):
                 reference_data = pd.read_csv("student_marks.csv")
             else:
@@ -59,7 +49,6 @@ class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
                 )
 
         data = reference_data.copy()
-        # Create label column the same way your original code did
         data["placed"] = (data["marks"] > self.threshold).astype(int)
         X = data[["marks"]].astype(float)
         y = data["placed"].astype(int)
@@ -76,10 +65,6 @@ class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
         return acc, data
 
     def predict(self, context, model_input: pd.DataFrame) -> np.ndarray:
-        """
-        model_input is expected to be a DataFrame or convertible to one and contain a 'marks' column.
-        Returns "Placed"/"Not Placed" strings.
-        """
         if self.pipeline is None:
             raise RuntimeError("Model pipeline is not fitted. Call fit() before predict().")
         if not isinstance(model_input, pd.DataFrame):
@@ -88,94 +73,28 @@ class StudentOfferLabelModel(mlflow.pyfunc.PythonModel):
         return np.where(preds == 1, "Placed", "Not Placed").astype(str)
 
     def load_context(self, context):
-        """
-        Called by MLflow when model is loaded in a different environment (e.g., inside the served Docker image).
-        mlflow passes a context.artifacts mapping: keys are artifact names used when logging the model,
-        values are local paths where mlflow extracted them inside the container.
-        """
         try:
-            # We logged the artifact with key 'data/student_marks.csv' (path-key),
-            # so look it up using that exact key.
             self.reference_csv_path = context.artifacts.get("data/student_marks.csv")
         except Exception:
             self.reference_csv_path = None
 
-        # Optionally, preload reference_data or do other init here
         if self.reference_csv_path and os.path.exists(self.reference_csv_path):
             try:
-                ref_df = pd.read_csv(self.reference_csv_path)
-                # you could compute stats or warm caches here if desired
-                # e.g., self.ref_stats = ref_df.describe()
+                _ = pd.read_csv(self.reference_csv_path)
             except Exception:
                 pass
 
 
+# ---------------------
+# Helpers
+# ---------------------
 def _ensure_url_scheme(url: str) -> str:
     if url.startswith("http://") or url.startswith("https://"):
         return url
     return "http://" + url
 
 
-def push_metrics_to_prometheus(
-    train_acc: float,
-    drift_score: float,
-    pushgateway_url: str,
-    job_name: str,
-    image_name: str,
-    image_version: str,
-    grouping_key: Optional[Dict[str, str]] = None,
-    variant: str = "champion",  
-):
-    pushgateway_url = _ensure_url_scheme(pushgateway_url)
-    registry = CollectorRegistry()
-
-    # numeric metrics
-    accuracy_metric = Gauge(
-        "student_model_train_accuracy", "Training accuracy", registry=registry
-    )
-    drift_metric = Gauge(
-        "student_model_drift_score", "Data drift score (percent)", registry=registry
-    )
-
-    accuracy_metric.set(float(train_acc))
-    drift_metric.set(float(drift_score))
-
-    # build/info metric (labels for name + version). value=1 just indicates existence.
-    build_info = Gauge(
-        "student_model_build_info",
-        "Build info: image name and version (value=1 means present)",
-        ["image_name", "image_version"],
-        registry=registry,
-    )
-    # set label combination to 1
-    # build_info.labels(image_name="evidently-metrics-student-offer_label_test", image_version="64").set(1)
-    build_info.labels(image_name=image_name, image_version=image_version, variant=variant).set(1)
-
-    # build the final grouping_key so all metrics get these labels when pushed
-    final_grouping = dict(grouping_key or {})
-    # defaults: keep run_id/experiment if provided but ensure variant + image labels present
-    final_grouping.setdefault("variant", variant)
-    final_grouping.setdefault("image_name", image_name)
-    final_grouping.setdefault("image_version", image_version)
-
-    try:
-        push_to_gateway(
-            pushgateway_url,
-            job=job_name,
-            registry=registry,
-            #grouping_key=grouping_key or {},
-            grouping_key=final_grouping,
-        )
-        print(
-            f"✅ Pushed metrics to Pushgateway at {pushgateway_url} (job={job_name}, grouping_key={final_grouping}, image={image_name}:{image_version}, variant={variant})"
-        )
-    except Exception as e:
-        print(f"⚠️ Failed to push metrics to Pushgateway at {pushgateway_url}: {e}")
-
 def _recursive_find(obj: Any, target_key: str) -> Optional[Any]:
-    """
-    Recursively search dictionaries/lists for the first occurrence of target_key and return its value.
-    """
     if isinstance(obj, dict):
         if target_key in obj:
             return obj[target_key]
@@ -191,19 +110,18 @@ def _recursive_find(obj: Any, target_key: str) -> Optional[Any]:
     return None
 
 
+# ---------------------
+# Main training flow
+# ---------------------
 def main(args):
-    # Connect to mlflow
     mlflow.set_tracking_uri(args.tracking_uri)
     mlflow.set_experiment(args.experiment_name)
 
-    # Validate reference path exists where given
     if not os.path.isfile(args.reference_path):
         raise FileNotFoundError(f"Reference CSV not found at: {args.reference_path}")
 
-    # Read the reference data (this is the baseline used by Evidently)
     reference_data = pd.read_csv(args.reference_path)
 
-    # Build and train model (we pass the DataFrame rather than hardcoding a name)
     model = StudentOfferLabelModel(threshold=args.threshold, epochs=args.epochs)
 
     # Start MLflow run
@@ -215,75 +133,43 @@ def main(args):
     with run_cm as run:
         print(f"RUN_ID: {run.info.run_id}")
 
-        # Fit using provided reference_data (so we don't rely on a hardcoded file inside fit())
+        # Fit model
         acc, ref_df = model.fit(reference_data=reference_data)
 
-        # Create signature for logging model
+        # Signature
         signature = ModelSignature(
             inputs=Schema([ColSpec("double", "marks")]),
             outputs=Schema([ColSpec("string", "prediction")]),
         )
 
+        # Log params & metrics
         mlflow.log_param("threshold", args.threshold)
         mlflow.log_param("epochs", args.epochs)
         mlflow.log_metric("train_accuracy", acc)
 
-        # Log the reference CSV as a run artifact (traceability) AND include it in model artifacts
-        # so the model bundle contains it for serving and for the docker build path.
-        try:
-            mlflow.log_artifact(args.reference_path, artifact_path="data")
-            print(f"✅ Logged reference CSV as run artifact: {args.reference_path}")
-        except Exception as e:
-            print(f"⚠️ Failed to log reference CSV as run artifact: {e}")
-
-        # Prepare artifacts mapping for model: key -> path inside model bundle, value -> local path
-        # NOTE: using a path-like key so it lands under /opt/ml/model/data/student_marks.csv in the image.
-        artifacts = {"data/student_marks.csv": args.reference_path}
-
-        # Log the mlflow.pyfunc model and include the CSV in the model bundle
-        try:
-            mlflow.pyfunc.log_model(
-                artifact_path="model",
-                python_model=model,
-                signature=signature,
-                artifacts=artifacts,  # bundle data/student_marks.csv into the model artifact
-            )
-            print("✅ Logged pyfunc model and included reference CSV as model artifact under data/")
-        except Exception as e:
-            print(f"⚠️ Failed to log model with artifacts: {e}")
-            raise
-
-        # Create synthetic current_data (you may replace with real incoming batch)
-        np.random.seed(42)
-        current_data = pd.DataFrame(
-            {
-                "student": [f"S{i+11}" for i in range(10)],
-                "marks": np.random.normal(loc=82, scale=5, size=10).round().astype(int),
-            }
-        )
-        current_data["placed"] = (current_data["marks"] > args.threshold).astype(int)
-
-        # Run Evidently report using the in-memory reference_data you read above
+        # Evidently drift evaluation (best-effort)
         drift_score_percent = 0.0
         try:
             report = Report(metrics=[DataDriftPreset(), ClassificationPreset()])
+            # Use ref_df (trained-on) and a small synthetic current_data for quick drift check
+            np.random.seed(42)
+            current_data = pd.DataFrame(
+                {
+                    "student": [f"S{i+11}" for i in range(10)],
+                    "marks": np.random.normal(loc=82, scale=5, size=10).round().astype(int),
+                }
+            )
+            current_data["placed"] = (current_data["marks"] > args.threshold).astype(int)
+
             report.run(reference_data=ref_df, current_data=current_data)
 
-            # Save and log report
-            report_path = "drift_report.html"
-            report.save_html(report_path)
-            mlflow.log_artifact(report_path, artifact_path="reports")
-            print(f"✅ Evidently report saved at {report_path} and logged to MLflow")
+            report.save_html("drift_report.html")
+            mlflow.log_artifact("drift_report.html", artifact_path="reports")
+            print("✅ Evidently report saved and logged")
 
-            # Extract drift metrics robustly
             report_dict = report.as_dict()
-            # Prefer a normalized share if present; otherwise derive from counts
             num_drifted = _recursive_find(report_dict, "number_of_drifted_columns")
-            total_cols = (
-                _recursive_find(report_dict, "number_of_columns")
-                or len(ref_df.columns)
-                or None
-            )
+            total_cols = _recursive_find(report_dict, "number_of_columns") or len(ref_df.columns) or None
             drift_share = _recursive_find(report_dict, "drift_share")
             drift_score_field = _recursive_find(report_dict, "drift_score")
 
@@ -297,35 +183,66 @@ def main(args):
             else:
                 drift_fraction = 0.0
 
-            # Use percent (0..100) for Prometheus metric
             drift_score_percent = float(drift_fraction) * 100.0
             print(f"Extracted drift fraction={drift_fraction}, percent={drift_score_percent}")
-
         except Exception as e:
-            print(f"ERROR while running Evidently report or extracting drift: {e}")
+            print(f"[WARN] Evidently drift check failed: {e}")
             drift_score_percent = 0.0
 
-        # Push metrics
-        grouping = {
-            "run_id": run.info.run_id,
-            "experiment": args.experiment_name,
-            "model": "student_offer",
-        }
-        push_metrics_to_prometheus(
-            train_acc=acc,
-            drift_score=drift_score_percent,
-            pushgateway_url=args.pushgateway_url,
-            job_name="test_student_model_monitoring",
-            image_name=args.image_name,
-            image_version=args.image_version,
-            grouping_key=grouping,
-        )
+        # Log drift metric to MLflow as well
+        mlflow.log_metric("drift_score_percent", drift_score_percent)
 
-        # Print MLflow UI link for convenience
-        print(
-            f"🔗 View in MLflow UI: {args.tracking_uri}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
-        )
+        # Log reference CSV as artifact and bundle into model artifacts
+        try:
+            mlflow.log_artifact(args.reference_path, artifact_path="data")
+            print(f"✅ Logged reference CSV as run artifact: {args.reference_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to log reference CSV as run artifact: {e}")
 
+        artifacts = {"data/student_marks.csv": args.reference_path}
+
+        # Log pyfunc model
+        try:
+            mlflow.pyfunc.log_model(
+                artifact_path="model",
+                python_model=model,
+                signature=signature,
+                artifacts=artifacts,
+            )
+            print("✅ Logged pyfunc model and included reference CSV in artifacts")
+        except Exception as e:
+            print(f"[ERROR] Failed to log model: {e}")
+            raise
+
+        # Optionally register model into Model Registry and tag version with run_id
+        if args.register_model:
+            model_uri = f"runs:/{run.info.run_id}/model"
+            model_name = args.model_name or "student_offer"
+            try:
+                print(f"[INFO] Registering model {model_name} from {model_uri}")
+                # mlflow.register_model returns a ModelVersion object in newer mlflow clients
+                mv = mlflow.register_model(model_uri=model_uri, name=model_name)
+                # Wait/ensure registration metadata may take some time depending on MLflow setup.
+                client = MlflowClient(tracking_uri=args.tracking_uri)
+                mv_number = mv.version if hasattr(mv, "version") else str(mv)  # defensive
+                # Add run_id tag on model version so deploy DAG can find mapping
+                try:
+                    client.set_model_version_tag(name=model_name, version=mv.version, key="run_id", value=run.info.run_id)
+                    client.set_model_version_tag(name=model_name, version=mv.version, key="mlflow_registered_by", value=os.getenv("USER", "unknown"))
+                    print(f"✅ Registered model {model_name}, version={mv.version} and tagged with run_id")
+                except Exception as e:
+                    print(f"[WARN] Model registered but failed to tag version: {e}")
+            except Exception as e:
+                print(f"[WARN] Model registration failed: {e}")
+
+        # print MLflow UI link
+        try:
+            print(f"🔗 View in MLflow UI: {args.tracking_uri}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}")
+        except Exception:
+            pass
+
+        # End run context
+    # end with run
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -333,25 +250,13 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--tracking_uri", type=str, default="http://10.0.11.179:5000")
     parser.add_argument("--experiment_name", type=str, default="sixdee_experiments")
-    parser.add_argument(
-        "--pushgateway_url", type=str, default="http://10.0.11.179:9091"
-    )
-    # ADD THESE TWO LINES:
-    parser.add_argument("--image_name", type=str, default=os.environ.get("IMAGE_NAME", "student-offer"),
-                        help="Image name to attach to pushed metrics (env IMAGE_NAME fallback)")
-    parser.add_argument("--image_version", type=str, default=os.environ.get("IMAGE_VERSION", "dev"),
-                        help="Image version to attach to pushed metrics (env IMAGE_VERSION fallback)")
-
-    parser.add_argument(
-        "--reference_path",
-        type=str,
-        required=True,
-        help="Local path to reference CSV that will be used as baseline and bundled into model artifacts.",
-    )
+    parser.add_argument("--pushgateway_url", type=str, default=None)  # kept for compatibility, unused
+    parser.add_argument("--image_name", type=str, default=os.environ.get("IMAGE_NAME", "student-offer"))
+    parser.add_argument("--image_version", type=str, default=os.environ.get("IMAGE_VERSION", "dev"))
+    parser.add_argument("--reference_path", type=str, required=True)
+    parser.add_argument("--register_model", type=lambda s: s.lower() in ["1", "true", "yes"], default=False,
+                        help="If true, register the model in MLflow Model Registry")
+    parser.add_argument("--model_name", type=str, default="student_offer", help="Registered model name (if --register_model True)")
     args = parser.parse_args()
 
     main(args)
-
-
-
-
