@@ -248,7 +248,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--threshold", type=float, default=80.0)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--tracking_uri", type=str, default="http://10.0.11.179:5000")
+    parser.add_argument("--tracking_uri", type=str, default="http://10.0.11.179:5001")
     parser.add_argument("--experiment_name", type=str, default="sixdee_experiments")
     parser.add_argument("--pushgateway_url", type=str, default=None)  # kept for compatibility, unused
     parser.add_argument("--image_name", type=str, default=os.environ.get("IMAGE_NAME", "student-offer"))
@@ -260,3 +260,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
+
