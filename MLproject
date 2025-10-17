@@ -4,9 +4,9 @@ entry_points:
   main:
     parameters:
       epochs: {type: integer, default: 1}
-    command: "python model_code.py --epochs {epochs}"
+    command: "python student_offer.py --epochs {epochs}"
 
   train_and_log:
     parameters:
       threshold: {type: float, default: 80.0}
-    command: "python model_code.py --threshold {threshold}"
+    command: "python student_offer.py --threshold {threshold}"
