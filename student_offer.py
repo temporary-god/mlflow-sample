@@ -175,7 +175,8 @@ if __name__ == "__main__":
     #parser.add_argument("--reference_path", type=str, required=True)
     parser.add_argument("--register_model", type=lambda s: s.lower() in ["1", "true", "yes"], default=False)
     parser.add_argument("--model_name", type=str, default="student_offer")
-    parser.add_argument("--reference_path", type=str, default="/home/coder/project/sample/student_marks.csv")
+    parser.add_argument("--reference_path", type=str, default="student_marks.csv")
     args = parser.parse_args()
 
     main(args)
+
